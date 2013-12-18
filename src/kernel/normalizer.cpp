@@ -6,7 +6,6 @@ Author: Leonardo de Moura
 */
 #include <algorithm>
 #include <limits>
-#include <unordered_map>
 #include "util/list.h"
 #include "util/flet.h"
 #include "util/freset.h"
@@ -73,23 +72,20 @@ closure const & to_closure(expr const & e) { lean_assert(is_closure(e));   retur
 
 /** \brief Expression normalizer. */
 class normalizer::imp {
-    typedef std::unordered_map<expr, expr, expr_hash_alloc, expr_eqp> cache;
-
     ro_environment::weak_ref m_env;
     context                  m_ctx;
-    cached_metavar_env       m_menv;
-    cache                    m_cache;
+    optional<metavar_env>    m_menv;
     unsigned                 m_max_depth;
     unsigned                 m_depth;
 
     ro_environment env() const { return ro_environment(m_env); }
 
     expr instantiate(expr const & e, unsigned n, expr const * s) {
-        return ::lean::instantiate(e, n, s, m_menv.to_some_menv());
+        return ::lean::instantiate(e, n, s, m_menv);
     }
 
     expr add_lift(expr const & m, unsigned s, unsigned n) {
-        return ::lean::add_lift(m, s, n, m_menv.to_some_menv());
+        return ::lean::add_lift(m, s, n, m_menv);
     }
 
     expr lookup(value_stack const & s, unsigned i) {
@@ -105,8 +101,6 @@ class normalizer::imp {
         context_entry const & entry = p.first;
         context const & entry_c     = p.second;
         if (entry.get_body()) {
-            // Save the current context and cache
-            freset<cache>    reset(m_cache);
             flet<context>    set(m_ctx, entry_c);
             unsigned k = m_ctx.size();
             return normalize(*(entry.get_body()), value_stack(), k);
@@ -148,12 +142,10 @@ class normalizer::imp {
         expr const & e        = c.get_expr();
         context const & ctx   = c.get_context();
         value_stack const & s = c.get_stack();
-        freset<cache>    reset(m_cache);
         flet<context>    set(m_ctx, ctx);
         if (is_abstraction(e)) {
             return update_abst(e, [&](expr const & d, expr const & b) {
                     expr new_d = reify(normalize(d, s, k), k);
-                    m_cache.clear(); // make sure we do not reuse cached values from the previous call
                     expr new_b = reify(normalize(b, extend(s, mk_var(k)), k+1), k+1);
                     return mk_pair(new_d, new_b);
                 });
@@ -184,14 +176,6 @@ class normalizer::imp {
         check_system("normalizer");
         if (m_depth > m_max_depth)
             throw kernel_exception(env(), "normalizer maximum recursion depth exceeded");
-        bool shared = false;
-        if (is_shared(a)) {
-            shared = true;
-            auto it = m_cache.find(a);
-            if (it != m_cache.end())
-                return it->second;
-        }
-
         expr r;
         switch (a.kind()) {
         case expr_kind::MetaVar: case expr_kind::Pi: case expr_kind::Lambda:
@@ -203,7 +187,7 @@ class normalizer::imp {
         case expr_kind::Constant: {
             object const & obj = env()->get_object(const_name(a));
             if (obj.is_definition() && !obj.is_opaque()) {
-                freset<cache> reset(m_cache);
+                freset<context> reset(m_ctx);
                 r = normalize(obj.get_value(), value_stack(), 0);
             } else {
                 r = a;
@@ -228,7 +212,6 @@ class normalizer::imp {
                         fv = abst_body(fv);
                     }
                     {
-                        freset<cache> reset(m_cache);
                         flet<context> set(m_ctx, to_closure(f).get_context());
                         f = normalize(fv, new_s, k);
                     }
@@ -268,41 +251,27 @@ class normalizer::imp {
         }
         case expr_kind::Let: {
             expr v = normalize(let_value(a), s, k);
-            {
-                freset<cache> reset(m_cache);
-                r = normalize(let_body(a), extend(s, v), k);
-            }
+            r = normalize(let_body(a), extend(s, v), k);
             break;
         }}
-        if (shared) {
-            m_cache[a] = r;
-        }
         return r;
-    }
-
-    void set_ctx(context const & ctx) {
-        if (!is_eqp(ctx, m_ctx)) {
-            m_ctx = ctx;
-            m_cache.clear();
-        }
     }
 
 public:
     imp(ro_environment const & env, unsigned max_depth):
         m_env(env) {
-        m_max_depth      = max_depth;
-        m_depth          = 0;
+        m_max_depth = max_depth;
+        m_depth     = 0;
     }
 
     expr operator()(expr const & e, context const & ctx, optional<metavar_env> const & menv) {
-        set_ctx(ctx);
-        if (m_menv.update(menv))
-            m_cache.clear();
+        m_ctx = ctx;
+        m_menv = menv;
         unsigned k = m_ctx.size();
         return reify(normalize(e, value_stack(), k), k);
     }
 
-    void clear() { m_ctx = context(); m_cache.clear(); m_menv.clear(); }
+    void clear() { m_ctx = context(); m_menv = none_menv(); }
 };
 
 normalizer::normalizer(ro_environment const & env, unsigned max_depth):m_ptr(new imp(env, max_depth)) {}
